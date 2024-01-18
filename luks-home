@@ -58,9 +58,9 @@ if [ "$#" -gt 0 ]; then
             username="$(printf '%s' "$2" | cut -d ':' -f 2)"
             partlabel="$(getPartlabel "${username}")"
             # set partition label
-            echo sgdisk --change-name="${partnum}:${partlabel}" "${dev}"
+            sgdisk --change-name="${partnum}:${partlabel}" "${dev}"
             # do not automount
-            echo sgdisk --attributes="${partnum}:set:63" "${dev}"
+            sgdisk --attributes="${partnum}:set:63" "${dev}"
         else
             echo "argument required: {device}:{username}"
             exit 1
