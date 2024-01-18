@@ -1,0 +1,163 @@
+#!/bin/sh
+
+escapePOSIX() {
+	printf "'%s'\\n" "$(printf '%s' "$1" | sed -e "s/'/'\\\\''/g")"
+}
+
+getDeviceUnit() {
+    escapePOSIX "$(systemd-escape --suffix='device' --path "$1" | sed 's/\\/\\\\/g' -)"
+}
+
+getPartlabel() {
+    echo "home$(printf '%s' "$1" | openssl dgst -md5 -r | cut -d ' ' -f 1)"
+}
+
+usage() {
+    echo "USAGE:"
+    echo "    Arguments override the corresponding value in the configuration file."
+    echo "    The configuration file is located at '/etc/luks-home.conf'."
+    echo "luks-home"
+    echo "    Unlock a home device home, arguments are required to be passed"
+    echo "    as pam_exec.so would."
+    echo "luks-home help"
+    echo "    Print this usage information."
+    echo "luks-home getlabel {username}"
+    echo "    Print the encoded partition label derived from the given username."
+    echo "luks-home setlabel {homepartition}:{username}"
+    echo "    Set the encoded partition label on the block device"
+    echo "    and prevent systemd trying to automount it."
+    echo "luks-home readpcr [{pcr}]"
+    echo "    Print value of specified prerequisite TPM PCRs."
+    echo "luks-home writepcr [{pcr} {pcrfile}]"
+    echo "    Write the current value of the specified prerequisite PCR to the specified file"
+    echo "    and if necessary update the configuration file."
+}
+
+CONFIGFILE='/etc/luks-home.conf'
+
+if [ "$#" -gt 0 ]; then
+    case "$1" in
+    help)
+        usage
+        exit
+        ;;
+    getlabel)
+        if [ -n "$2" ]; then
+            getPartlabel "$2"
+        else
+            echo "argument required: {username}"
+            exit 1
+        fi
+        exit
+        ;;
+    setlabel)
+        if [ -n "$2" ]; then
+            partition="$(realpath "$(printf '%s' "$2" | cut -d ':' -f 1)")"
+            partnum="$(echo "${partition}" | grep -Po '^.*p\K\d+$')"
+            dev="${partition%%"p${partnum}"}"
+            username="$(printf '%s' "$2" | cut -d ':' -f 2)"
+            partlabel="$(getPartlabel "${username}")"
+            # set partition label
+            echo sgdisk --change-name="${partnum}:${partlabel}" "${dev}"
+            # do not automount
+            echo sgdisk --attributes="${partnum}:set:63" "${dev}"
+        else
+            echo "argument required: {device}:{username}"
+            exit 1
+        fi
+        exit
+        ;;
+    readpcr)
+        if [ -n "$2" ]; then
+            PCRPREREQS="$2"
+        else
+            if [ ! -f "${CONFIGFILE}" ]; then
+                echo "Configuration file ${CONFIGFILE} does not exist and no pcr specifier was given"
+                exit 1
+            fi
+            . "${CONFIGFILE}"
+            if [ -z "${PCRPREREQS}" ]; then
+                echo "No PCR specifier found in the config file and none given as argument"
+                exit 1
+            fi
+        fi
+        tpm2_pcrread "${PCRPREREQS}"
+        ;;
+    writepcr)
+        if [ "$#" -eq 3 ]; then
+            PCRPREREQS="$2"
+            PCRPREREQFILE="$3"
+        elif [ "$#" -ne 1 ]; then
+            echo "invalid number of argumenents for 'writepcr': require exactly zero or two arguments"
+            exit 1
+        fi
+        if [ -f "${CONFIGFILE}" ]; then
+            . "${CONFIGFILE}"
+        fi
+        if [ -z "${PCRPREREQS}" ] || [ -z "${PCRPREREQFILE}" ]; then
+            echo "No PCR prerequisite specifier OR no file to write value to"
+            exit 1
+        fi
+        tpm2_pcrread "${PCRPREREQS}" > "${PCRPREREQFILE}"
+        echo "PCRPREREQS='${PCRPREREQS}'" >> "${CONFIGFILE}"
+        echo "PCRPREREQFILE='${PCRPREREQFILE}'" >> "${CONFIGFILE}"
+        ;;
+    *)
+        echo "invalid argument(s)"
+        usage
+        exit 1
+        ;;
+    esac
+fi
+
+MAPPEDNAME="home-${PAM_USER}"
+
+if [ -b "/dev/mapper/${MAPPEDNAME}" ]; then
+    exit 0  # already unlocked, therefor nothing to be done
+fi
+
+PARTLABEL="$(getPartlabel "${PAM_USER}")"
+DEVICE="/dev/disk/by-partlabel/${PARTLABEL}"
+
+if [ -b "${DEVICE}" ]; then
+    . "${CONFIGFILE}"
+    tpmArg='tpm2-measure-pcr='
+    if [ -f "${PCRPREREQFILE}" ]; then
+        if [ "$(cat "${PCRPREREQFILE}")" = "$(tpm2_pcrread "${PCRPREREQS}")" ]; then
+            tpmArg="${tpmArg}yes"
+        else
+            tpmArg="${tpmArg}no"
+        fi
+    else
+        tpmArg="${tpmArg}no"
+    fi
+
+    systemd-cryptsetup attach "${MAPPEDNAME}" "${DEVICE}" "/dev/stdin" "luks,discard,noauto,headless,${tpmArg}"
+
+    uid=$(id -u "${PAM_USER}")
+
+    systemd-mount "/dev/mapper/${MAPPEDNAME}" "/home/${PAM_USER}" \
+        --options=defaults,relatime \
+        --property="Requires=user@${uid}.service" \
+        --property="Before=user@${uid}.service"
+
+    luksDeviceUnit="$(getDeviceUnit "$(realpath "${DEVICE}")")"
+    mappedDeviceUnit="$(getDeviceUnit "/dev/mapper/${MAPPEDNAME}")"
+
+    systemd-run \
+        --unit="luks-${MAPPEDNAME}" \
+        --service-type=oneshot \
+        --remain-after-exit \
+        --property="TimeoutStartSec=infinity" \
+        --property="TimeoutStopSec=1" \
+        --property="DefaultDependencies=no" \
+        --property="BindsTo=${luksDeviceUnit}" \
+        --property="After=${luksDeviceUnit}" \
+        --property="BindsTo=${mappedDeviceUnit}" \
+        --property="Requires=${MAPPEDNAME}.mount" \
+        --property="Before=${MAPPEDNAME}.mount" \
+        --property="Conflicts=umount.target" \
+        --property="Before=umount.target" \
+        --property="ExecStop=cryptsetup close ${MAPPEDNAME}" \
+        "noop"
+fi
